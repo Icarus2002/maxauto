@@ -112,7 +112,9 @@ async function fetchMax(path, method, headers, bytes) {
 
 export default async function handler(request) {
   const url = new URL(request.url);
-  const rawPath = url.searchParams.get('max_path');
+const rawPath = url.pathname.startsWith('/api/')
+  ? url.pathname.slice('/api/'.length)
+  : url.searchParams.get('max_path');
   const path = normalizeTargetPath(rawPath);
   const method = request.method.toUpperCase();
 
@@ -176,3 +178,8 @@ export default async function handler(request) {
     return json(502, { error: 'MAX_UPSTREAM_FAILED', reason: code });
   }
 }
+
+export const config = {
+  path: "/api/*"
+};
+
