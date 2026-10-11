@@ -51,21 +51,63 @@ function authorized(value, expected) {
   return timingSafeEqual(a, b);
 }
 
-function makeTlsOptions() {
+// Official Russian Trusted CA certificate files, retrieved over normal HTTPS.
+// Only the connection to MAX uses these additional trust anchors.
+const MAX_CA_URLS = [
+  'https://gu-st.ru/content/lending/russian_trusted_root_ca_pem.crt',
+  'https://gu-st.ru/content/lending/russian_trusted_sub_ca_pem.crt'
+];
+let maxCaPromise;
+
+async function fetchTrustedCa(url) {
+  const response = await fetch(url, {
+    method: 'GET',
+    redirect: 'error',
+    signal: AbortSignal.timeout(10_000)
+  });
+  if (!response.ok) {
+    throw Object.assign(new Error('Official CA source returned HTTP ' + response.status), {
+      code: 'MAX_CA_DOWNLOAD_FAILED'
+    });
+  }
+  const pem = (await response.text()).trim();
+  if (pem.length > 100_000 ||
+      !/^-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\s]+-----END CERTIFICATE-----$/.test(pem)) {
+    throw Object.assign(new Error('Invalid CA certificate from official source'), {
+      code: 'MAX_CA_INVALID'
+    });
+  }
+  try { new (await import('node:crypto')).X509Certificate(pem); }
+  catch {
+    throw Object.assign(new Error('Unparseable CA certificate'), { code: 'MAX_CA_INVALID' });
+  }
+  return pem + '\n';
+}
+
+async function makeTlsOptions() {
+  if (!maxCaPromise) {
+    maxCaPromise = Promise.all(MAX_CA_URLS.map(fetchTrustedCa))
+      .catch(err => {
+        maxCaPromise = null;  // Retry later if official service was temporarily unavailable.
+        throw err;
+      });
+  }
+  const certs = await maxCaPromise;
   const result = {
     servername: MAX_HOST,
-    rejectUnauthorized: true
+    rejectUnauthorized: true,
+    ca: [...tls.rootCertificates, ...certs]
   };
+  // Retain compatibility with manually configured CA, if present.
   const pemB64 = process.env.MAX_EXTRA_CA_PEM_BASE64 || '';
   if (pemB64) {
     const pem = Buffer.from(pemB64, 'base64').toString('utf8');
     if (!pem.includes('-----BEGIN CERTIFICATE-----')) {
       throw new Error('MAX_EXTRA_CA_PEM_BASE64 is invalid');
     }
-    // Preserve existing public roots and add the extra trusted CA.
-    result.ca = [...tls.rootCertificates, pem];
+    result.ca.push(pem);
   }
-  // Emergency compatibility only. Do not enable for long-term production.
+  // Temporary emergency option only; never enable in normal production.
   if (process.env.ALLOW_UNVERIFIED_MAX_TLS === 'true') {
     result.rejectUnauthorized = false;
   }
@@ -73,8 +115,8 @@ function makeTlsOptions() {
 }
 
 async function fetchMax(path, method, headers, bytes) {
+  const tlsOpts = await makeTlsOptions();
   return new Promise((resolve, reject) => {
-    const tlsOpts = makeTlsOptions();
     const req = https.request({
       hostname: MAX_HOST,
       port: 443,
@@ -112,9 +154,9 @@ async function fetchMax(path, method, headers, bytes) {
 
 export default async function handler(request) {
   const url = new URL(request.url);
-const rawPath = url.pathname.startsWith('/api/')
-  ? url.pathname.slice('/api/'.length)
-  : url.searchParams.get('max_path');
+  const rawPath = url.pathname.startsWith('/api/')
+    ? url.pathname.slice('/api/'.length)
+    : url.searchParams.get('max_path');
   const path = normalizeTargetPath(rawPath);
   const method = request.method.toUpperCase();
 
@@ -182,4 +224,3 @@ const rawPath = url.pathname.startsWith('/api/')
 export const config = {
   path: "/api/*"
 };
-
